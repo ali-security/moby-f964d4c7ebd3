@@ -1,211 +1,214 @@
 name: test
 
-# Default to 'contents: read', which grants actions to read commits.
-#
-# If any permission is set, any permission not included in the list is
-# implicitly set to "none".
-#
-# see https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions
 permissions:
   contents: read
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - 'master'
-      - '[0-9]+.[0-9]+'
-      - '[0-9]+.x'
-  pull_request:
-
-env:
-  GO_VERSION: "1.24.9"
-  GIT_PAGER: "cat"
-  PAGER: "cat"
-  SETUP_BUILDX_VERSION: edge
-  SETUP_BUILDKIT_IMAGE: moby/buildkit:latest
 
 jobs:
-  validate-dco:
-    uses: ./.github/workflows/.dco.yml
-
-  build-dev:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120 # guardrails timeout for the whole job
-    needs:
-      - validate-dco
-    strategy:
-      fail-fast: false
-      matrix:
-        mode:
-          - ""
-          - systemd
-          - firewalld
-    steps:
-      -
-        name: Prepare
-        run: |
-          if [ "${{ matrix.mode }}" = "systemd" ]; then
-            echo "SYSTEMD=true" >> $GITHUB_ENV
-          fi
-      -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          version: ${{ env.SETUP_BUILDX_VERSION }}
-          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
-          buildkitd-flags: --debug
-      -
-        name: Build dev image
-        uses: docker/bake-action@v6
-        with:
-          targets: dev
-          set: |
-            *.cache-from=type=gha,scope=dev${{ matrix.mode }}
-            *.cache-to=type=gha,scope=dev${{ matrix.mode }}
-            *.output=type=cacheonly
-
   test:
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - build-dev
-      - validate-dco
-    uses: ./.github/workflows/.test.yml
-    secrets: inherit
     strategy:
       fail-fast: false
       matrix:
-        storage:
-          - graphdriver
-          - snapshotter
-    with:
-      storage: ${{ matrix.storage }}
-
-  test-unit:
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - build-dev
-      - validate-dco
-    uses: ./.github/workflows/.test-unit.yml
-    secrets: inherit
-
-  validate-prepare:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10 # guardrails timeout for the whole job
-    needs:
-      - validate-dco
-    outputs:
-      matrix: ${{ steps.scripts.outputs.matrix }}
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v4
-      -
-        name: Create matrix
-        id: scripts
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Stage module files
+        shell: bash
         run: |
-          scripts=$(cd ./hack/validate && jq -nc '$ARGS.positional - ["all", "default", "dco"] | map(select(test("[.]")|not)) + ["generate-files"]' --args *)
-          echo "matrix=$scripts" >> $GITHUB_OUTPUT
-      -
-        name: Show matrix
+          # The repo is pre-module: it ships vendor.mod / vendor.sum instead of
+          # go.mod / go.sum. Stage them so the toolchain can resolve packages.
+          cp vendor.mod go.mod
+          cp vendor.sum go.sum
+      - name: Unit tests
+        shell: bash
         run: |
-          echo ${{ steps.scripts.outputs.matrix }}
+          BASE="./client/... ./errdefs/... ./opts/... ./pkg/archive/... ./pkg/homedir/... ./pkg/idtools/... ./pkg/jsonmessage/... ./pkg/namesgenerator/... ./pkg/stdcopy/... ./pkg/stringid/... ./pkg/tailfile/... ./api/types/... ./pkg/authorization/..."
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            PKGS="$BASE ./plugin/ ./daemon/"
+            # TestImpliedDirectoryPermissions needs root (GitHub runners are non-root).
+            # TestIfaceAddrs needs a network namespace (CAP_SYS_ADMIN).
+            # TestExecSetPlatformOptAppArmor needs /sys/kernel/security/apparmor.
+            SKIP="TestImpliedDirectoryPermissions|TestIfaceAddrs|TestExecSetPlatformOptAppArmor"
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            PKGS="$BASE ./plugin/"
+            # TestImpliedDirectoryPermissions needs root (GitHub runners are non-root).
+            SKIP="TestImpliedDirectoryPermissions"
+          else
+            # ./plugin/ and ./daemon/ do not compile on darwin: internal/containerfs
+            # and libnetwork/iptables have no darwin implementation files.
+            PKGS="$BASE"
+            # TestImpliedDirectoryPermissions needs root (GitHub runners are non-root).
+            # TestChangesWithChangesGH13590 / TestApplyLayer differ on APFS+BSD
+            # (chown, symlink and tar-layer behaviour); upstream never tests macOS.
+            SKIP="TestImpliedDirectoryPermissions|TestChangesWithChangesGH13590|TestApplyLayer"
+          fi
+          echo "RUNNER_OS=$RUNNER_OS"
+          echo "PKGS=$PKGS"
+          echo "SKIP=$SKIP"
+          go test -mod=vendor -count=1 -short -timeout 25m -skip "$SKIP" $PKGS
 
-  validate:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30 # guardrails timeout for the whole job
-    needs:
-      - validate-prepare
-      - build-dev
-    strategy:
-      fail-fast: true
-      matrix:
-        script: ${{ fromJson(needs.validate-prepare.outputs.matrix) }}
+  integration-copy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          fetch-depth: 0
-      -
-        name: Set up runner
-        uses: ./.github/actions/setup-runner
-      -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          version: ${{ env.SETUP_BUILDX_VERSION }}
-          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
-          buildkitd-flags: --debug
-      -
-        name: Build dev image
-        uses: docker/bake-action@v6
-        with:
-          targets: dev
-          set: |
-            dev.cache-from=type=gha,scope=dev
-      -
-        name: Validate
+          go-version: "1.24"
+          cache: false
+      - name: Stage module files
+        shell: bash
         run: |
-          make -o build validate-${{ matrix.script }}
+          cp vendor.mod go.mod
+          cp vendor.sum go.sum
+      - name: Pre-tag frozen images
+        shell: bash
+        run: |
+          # testutil/environment/frozen.go auto-pull is broken in this tree: it
+          # greps the Dockerfile for "RUN ./contrib/download-frozen-image-v2.sh"
+          # while the Dockerfile actually says "RUN /download-frozen-image-v2.sh
+          # /build". TestMain panics unless the images already exist locally, so
+          # pull and tag them up front.
+          docker pull busybox:latest
+          docker pull hello-world:latest
+          docker pull debian:bookworm-slim
+          docker tag busybox:latest busybox:glibc
+          docker tag hello-world:latest hello-world:frozen
+          docker tag hello-world:latest hello-world:amd64
+          docker tag hello-world:latest hello-world:arm64
+          docker image ls
+      - name: Integration copy tests
+        shell: bash
+        run: |
+          # The source declares API version 1.51; the runner's daemon is older and
+          # TestMain panics with "client version is too new". Derive it at runtime.
+          export DOCKER_API_VERSION="$(docker version --format '{{.Server.APIVersion}}')"
+          # frozen.go opens filepath.Dir(cwd)/Dockerfile.
+          export DOCKERFILE=../Dockerfile
+          echo "DOCKER_API_VERSION=$DOCKER_API_VERSION"
+          go test -mod=vendor -count=1 -timeout 25m -run 'TestCopy' -v ./integration/container/
 
-  smoke-prepare:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10 # guardrails timeout for the whole job
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - validate-dco
-    outputs:
-      matrix: ${{ steps.platforms.outputs.matrix }}
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      -
-        name: Checkout
+      - name: Checkout
         uses: actions/checkout@v4
-      -
-        name: Create matrix
-        id: platforms
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Restore pristine .github
+        shell: bash
         run: |
-          matrix="$(docker buildx bake binary-smoketest --print | jq -cr '.target."binary-smoketest".platforms')"
-          echo "matrix=$matrix" >> $GITHUB_OUTPUT
-      -
-        name: Show matrix
+          # The published Go module zip ships .github/** (all workflow files), so
+          # our workflow edits must not leak into the artifact. Restore the
+          # upstream v28.5.2 .github tree before zipping.
+          curl -sSfL -o /tmp/upstream.tar.gz https://github.com/moby/moby/archive/refs/tags/v28.5.2.tar.gz
+          mkdir -p /tmp/upstream
+          tar -xzf /tmp/upstream.tar.gz -C /tmp/upstream
+          rm -rf .github
+          cp -r /tmp/upstream/moby-28.5.2/.github .github
+      - name: Clean tree
+        shell: bash
         run: |
-          echo ${{ steps.platforms.outputs.matrix }}
+          # The proxy zip contains neither go.mod nor go.sum; the absence of
+          # go.mod is what makes this version "+incompatible".
+          rm -rf .git
+          rm -f go.mod go.sum
+      - name: Build module-zip helper
+        shell: bash
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          # The helper module dir must live outside $GOPATH.
+          mkdir -p /tmp/helper
+          cat > /tmp/helper/main.go <<'EOF'
+          package main
 
-  smoke:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20 # guardrails timeout for the whole job
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - smoke-prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: ${{ fromJson(needs.smoke-prepare.outputs.matrix) }}
-    steps:
-      -
-        name: Prepare
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[2])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              v := module.Version{Path: "github.com/docker/docker", Version: "v28.5.2+incompatible"}
+              if err := zip.CreateFromDir(f, v, os.Args[1]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          cd /tmp/helper
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          go build -o /tmp/create_mod .
+      - name: Create module zip
+        shell: bash
         run: |
-          platform=${{ matrix.platform }}
-          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
-      -
-        name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-      -
-        name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          # Output lives outside the directory being zipped so the zip cannot
+          # capture itself.
+          mkdir -p /tmp/out
+          /tmp/create_mod "$GITHUB_WORKSPACE" /tmp/out/v28.5.2+incompatible.zip
+      - name: Append vendor/modules.txt
+        shell: bash
+        run: |
+          # zip.CreateFromDir drops vendor/ entirely, but the reference zip keeps
+          # vendor/modules.txt. zip -g uses the on-disk path as the entry name,
+          # so stage the file under its exact in-zip path first.
+          PREFIX='github.com/docker/docker@v28.5.2+incompatible'
+          mkdir -p "/tmp/scratch/$PREFIX/vendor"
+          cp "$GITHUB_WORKSPACE/vendor/modules.txt" "/tmp/scratch/$PREFIX/vendor/modules.txt"
+          cd /tmp/scratch
+          zip -g -X /tmp/out/v28.5.2+incompatible.zip "$PREFIX/vendor/modules.txt"
+      - name: Verify zip contents
+        shell: bash
+        run: |
+          PREFIX='github.com/docker/docker@v28.5.2+incompatible'
+          unzip -l /tmp/out/v28.5.2+incompatible.zip | tail -5
+          entries="$(unzip -Z1 /tmp/out/v28.5.2+incompatible.zip | wc -l)"
+          echo "entry count: $entries"
+          if ! unzip -Z1 /tmp/out/v28.5.2+incompatible.zip | grep -qx "$PREFIX/vendor/modules.txt"; then
+            echo "ERROR: vendor/modules.txt missing from module zip"
+            exit 1
+          fi
+          if unzip -Z1 /tmp/out/v28.5.2+incompatible.zip | grep -qx "$PREFIX/go.mod"; then
+            echo "ERROR: go.mod present in module zip"
+            exit 1
+          fi
+          if unzip -Z1 /tmp/out/v28.5.2+incompatible.zip | grep -qx "$PREFIX/go.sum"; then
+            echo "ERROR: go.sum present in module zip"
+            exit 1
+          fi
+          echo "module zip contents verified"
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp /tmp/out/v28.5.2+incompatible.zip "$GITHUB_WORKSPACE/out/v28.5.2+incompatible.zip"
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
         with:
-          version: ${{ env.SETUP_BUILDX_VERSION }}
-          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
-          buildkitd-flags: --debug
-      -
-        name: Test
-        uses: docker/bake-action@v6
-        with:
-          targets: binary-smoketest
-          set: |
-            *.platform=${{ matrix.platform }}
+          name: module-zip
+          path: out/v28.5.2+incompatible.zip
+          if-no-files-found: error
