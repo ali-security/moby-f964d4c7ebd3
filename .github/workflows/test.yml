@@ -89,6 +89,45 @@ jobs:
           docker tag hello-world:latest hello-world:amd64
           docker tag hello-world:latest hello-world:arm64
           docker image ls
+      - name: Build dockerd from source
+        shell: bash
+        run: |
+          # testutil/daemon spawns "dockerd" resolved from $PATH. The runner ships
+          # its own (unpatched) dockerd, so without this the test-spawned daemon
+          # would not contain our fix and the regression test would exercise the
+          # wrong binary. Build the daemon from this tree and put it first on
+          # $PATH. This mirrors hack/make/binary-daemon, which is just a static
+          # build of ./cmd/dockerd.
+          sudo apt-get install -y --no-install-recommends libseccomp-dev
+          mkdir -p /tmp/dockerd-bin
+          # Only the seccomp tag is needed here; "journald" would additionally
+          # require libsystemd-dev and the log driver is irrelevant to this test.
+          go build -mod=vendor -tags seccomp \
+            -o /tmp/dockerd-bin/dockerd ./cmd/dockerd
+          /tmp/dockerd-bin/dockerd --version
+      - name: Provide containerd socket for test daemons
+        shell: bash
+        run: |
+          # testutil/daemon defaults --containerd to
+          # /var/run/docker/containerd/containerd.sock (where moby's own dev
+          # container puts it). On a GitHub runner containerd is a system
+          # service at /run/containerd/containerd.sock, so a test-spawned
+          # dockerd blocks for its 1m connect timeout and then "exited and
+          # never started". Link the expected path to the real socket; each
+          # test daemon still gets its own --containerd-namespace, so it stays
+          # isolated from the runner's own daemon.
+          # "systemctl start" is idempotent: it is a no-op when already active.
+          sudo systemctl start containerd
+          for i in $(seq 1 30); do
+            [ -S /run/containerd/containerd.sock ] && break
+            sleep 1
+          done
+          test -S /run/containerd/containerd.sock
+          sudo mkdir -p /var/run/docker/containerd
+          sudo ln -sf /run/containerd/containerd.sock /var/run/docker/containerd/containerd.sock
+          # /var/run/docker is root-only (0700), so stat it as root.
+          sudo test -S /var/run/docker/containerd/containerd.sock
+          sudo ls -l /var/run/docker/containerd/containerd.sock
       - name: Integration copy tests
         shell: bash
         run: |
@@ -98,7 +137,17 @@ jobs:
           # frozen.go opens filepath.Dir(cwd)/Dockerfile.
           export DOCKERFILE=../Dockerfile
           echo "DOCKER_API_VERSION=$DOCKER_API_VERSION"
-          go test -mod=vendor -count=1 -timeout 25m -run 'TestCopy' -v ./integration/container/
+          # Tests that spawn their own dockerd through testutil/daemon need root:
+          # dockerd refuses to start unprivileged ("dockerd needs to be started
+          # with root privileges"). Upstream runs the integration suite as root
+          # inside its dev container; the GitHub runner's default user is not
+          # root, so elevate here. -E keeps the exported vars above, and PATH is
+          # forwarded explicitly so "go" and "dockerd" still resolve under sudo.
+          # /tmp/dockerd-bin holds the dockerd built from THIS tree; it must come
+          # first so testutil/daemon's exec.LookPath("dockerd") finds the patched
+          # daemon rather than the runner's preinstalled one.
+          sudo -E env "PATH=/tmp/dockerd-bin:$PATH" \
+            go test -mod=vendor -count=1 -timeout 25m -run 'TestCopy' -v ./integration/container/
 
   module-zip:
     runs-on: ubuntu-latest
