@@ -56,6 +56,18 @@ jobs:
           echo "PKGS=$PKGS"
           echo "SKIP=$SKIP"
           go test -mod=vendor -count=1 -short -timeout 25m -skip "$SKIP" $PKGS
+      - name: Container FS mount-target tests
+        shell: bash
+        run: |
+          # daemon/containerfs_linux.go (and its test) are Linux-only: the mount
+          # target handling uses Linux mount syscalls and moby's daemon package
+          # has no darwin implementation at all. Run the mount-target regression
+          # tests verbosely so the per-subtest results are visible in the log.
+          if [ "$RUNNER_OS" != "Linux" ]; then
+            echo "skipping: daemon/containerfs_linux.go is linux-only (no darwin/windows implementation)"
+            exit 0
+          fi
+          go test -mod=vendor -count=1 -v -timeout 10m -run 'TestOpenMountTarget' ./daemon/
 
   integration-copy:
     runs-on: ubuntu-latest
