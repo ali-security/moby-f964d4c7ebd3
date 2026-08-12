@@ -53,6 +53,9 @@ jobs:
     steps:
       -
         name: Enable long paths
+        # The job default working-directory is the checkout target, which does
+        # not exist yet at this point.
+        working-directory: ${{ github.workspace }}
         run: |
           git config --system core.longpaths true
       -
@@ -121,6 +124,9 @@ jobs:
     steps:
       -
         name: Enable long paths
+        # The job default working-directory is the checkout target, which does
+        # not exist yet at this point.
+        working-directory: ${{ github.workspace }}
         run: |
           git config --system core.longpaths true
       -
@@ -272,6 +278,9 @@ jobs:
     steps:
       -
         name: Enable long paths
+        # The job default working-directory is the checkout target, which does
+        # not exist yet at this point.
+        working-directory: ${{ github.workspace }}
         run: |
           git config --system core.longpaths true
       -
