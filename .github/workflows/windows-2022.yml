@@ -38,4 +38,4 @@ jobs:
     with:
       os: windows-2022
       storage: ${{ matrix.storage }}
-      send_coverage: true
+      send_coverage: false
