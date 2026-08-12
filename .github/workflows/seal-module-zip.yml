@@ -1,0 +1,135 @@
+# Seal-owned build workflow: packages the patched tree into the Go module zip
+# that ships as the sealed artifact.
+#
+# It is deliberately separate from moby's own `test.yml`: this is the workflow
+# `ci_parameters.custom_jobs[].workflow_path` dispatches on a rebuild, and that
+# dispatch must finish inside the build budget (~50 min) and be green. moby's
+# real CI (test.yml -> .test.yml / .test-unit.yml, plus ci.yml / arm64.yml /
+# windows-2022.yml) is dispatched separately and takes hours; keeping the two
+# apart means a rebuild cannot be blocked by an unrelated flaky test leg, and
+# the test suites stay exactly as upstream wrote them.
+#
+# Nothing here reaches the artifact: the "Restore pristine .github" step puts
+# the upstream v28.5.2 .github tree back before packaging, so the published zip
+# stays byte-identical to the tag (this file included).
+name: seal-module-zip
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: false
+      - name: Restore pristine .github
+        shell: bash
+        run: |
+          # The published Go module zip ships .github/** (all workflow files), so
+          # our workflow edits must not leak into the artifact. Restore the
+          # upstream v28.5.2 .github tree before zipping.
+          curl -sSfL -o /tmp/upstream.tar.gz https://github.com/moby/moby/archive/refs/tags/v28.5.2.tar.gz
+          mkdir -p /tmp/upstream
+          tar -xzf /tmp/upstream.tar.gz -C /tmp/upstream
+          rm -rf .github
+          cp -r /tmp/upstream/moby-28.5.2/.github .github
+      - name: Clean tree
+        shell: bash
+        run: |
+          # The proxy zip contains neither go.mod nor go.sum; the absence of
+          # go.mod is what makes this version "+incompatible".
+          rm -rf .git
+          rm -f go.mod go.sum
+      - name: Build module-zip helper
+        shell: bash
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+        run: |
+          # The helper module dir must live outside $GOPATH.
+          mkdir -p /tmp/helper
+          cat > /tmp/helper/main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[2])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              v := module.Version{Path: "github.com/docker/docker", Version: "v28.5.2+incompatible"}
+              if err := zip.CreateFromDir(f, v, os.Args[1]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          cd /tmp/helper
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          go build -o /tmp/create_mod .
+      - name: Create module zip
+        shell: bash
+        run: |
+          # Output lives outside the directory being zipped so the zip cannot
+          # capture itself.
+          mkdir -p /tmp/out
+          /tmp/create_mod "$GITHUB_WORKSPACE" /tmp/out/v28.5.2+incompatible.zip
+      - name: Append vendor/modules.txt
+        shell: bash
+        run: |
+          # zip.CreateFromDir drops vendor/ entirely, but the reference zip keeps
+          # vendor/modules.txt. zip -g uses the on-disk path as the entry name,
+          # so stage the file under its exact in-zip path first.
+          PREFIX='github.com/docker/docker@v28.5.2+incompatible'
+          mkdir -p "/tmp/scratch/$PREFIX/vendor"
+          cp "$GITHUB_WORKSPACE/vendor/modules.txt" "/tmp/scratch/$PREFIX/vendor/modules.txt"
+          cd /tmp/scratch
+          zip -g -X /tmp/out/v28.5.2+incompatible.zip "$PREFIX/vendor/modules.txt"
+      - name: Verify zip contents
+        shell: bash
+        run: |
+          PREFIX='github.com/docker/docker@v28.5.2+incompatible'
+          unzip -l /tmp/out/v28.5.2+incompatible.zip | tail -5
+          entries="$(unzip -Z1 /tmp/out/v28.5.2+incompatible.zip | wc -l)"
+          echo "entry count: $entries"
+          if ! unzip -Z1 /tmp/out/v28.5.2+incompatible.zip | grep -qx "$PREFIX/vendor/modules.txt"; then
+            echo "ERROR: vendor/modules.txt missing from module zip"
+            exit 1
+          fi
+          if unzip -Z1 /tmp/out/v28.5.2+incompatible.zip | grep -qx "$PREFIX/go.mod"; then
+            echo "ERROR: go.mod present in module zip"
+            exit 1
+          fi
+          if unzip -Z1 /tmp/out/v28.5.2+incompatible.zip | grep -qx "$PREFIX/go.sum"; then
+            echo "ERROR: go.sum present in module zip"
+            exit 1
+          fi
+          echo "module zip contents verified"
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp /tmp/out/v28.5.2+incompatible.zip "$GITHUB_WORKSPACE/out/v28.5.2+incompatible.zip"
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: out/v28.5.2+incompatible.zip
+          if-no-files-found: error

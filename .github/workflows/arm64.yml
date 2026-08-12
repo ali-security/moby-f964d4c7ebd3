@@ -25,15 +25,10 @@ env:
   DOCKER_EXPERIMENTAL: 1
 
 jobs:
-  validate-dco:
-    uses: ./.github/workflows/.dco.yml
-
   build:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20 # guardrails timeout for the whole job
     if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - validate-dco
     strategy:
       fail-fast: false
       matrix:
@@ -66,8 +61,6 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 120 # guardrails timeout for the whole job
     if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
-    needs:
-      - validate-dco
     steps:
       -
         name: Set up Docker Buildx

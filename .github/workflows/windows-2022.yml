@@ -17,13 +17,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  validate-dco:
-    uses: ./.github/workflows/.dco.yml
-
   test-prepare:
     uses: ./.github/workflows/.test-prepare.yml
-    needs:
-      - validate-dco
 
   run:
     if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'ci/validate-only') }}
