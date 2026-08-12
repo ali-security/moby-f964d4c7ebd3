@@ -58,6 +58,8 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           git config --system core.longpaths true
+          if (Get-Service docker -ErrorAction SilentlyContinue) { Start-Service docker }
+          docker version
       -
         name: Checkout
         uses: actions/checkout@v4
@@ -129,6 +131,8 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           git config --system core.longpaths true
+          if (Get-Service docker -ErrorAction SilentlyContinue) { Start-Service docker }
+          docker version
       -
         name: Checkout
         uses: actions/checkout@v4
@@ -283,6 +287,8 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           git config --system core.longpaths true
+          if (Get-Service docker -ErrorAction SilentlyContinue) { Start-Service docker }
+          docker version
       -
         name: Checkout
         uses: actions/checkout@v4
